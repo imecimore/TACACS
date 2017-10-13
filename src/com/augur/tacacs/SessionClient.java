@@ -1,6 +1,10 @@
 package com.augur.tacacs;
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * @author Chris.Janicki@augur.com
@@ -12,11 +16,14 @@ public class SessionClient extends Session
 	private static final boolean DEBUG = false;
 	private final UserInterface ui;
 	private final boolean singleConnect;
-	
+	private byte headerFlags;
+	private static final AtomicInteger PPP_ID = new AtomicInteger(); // for CHAP
+	private static final int CHAP_CHALLENGE_LENGTH = 16;
+
 	/** Client-side constructor; end-user should use newSession() in TacacsReader. */
-	SessionClient(TAC_PLUS.AUTHEN.SVC svc, String port, String rem_addr, byte priv_lvl, TacacsReader tacacs, boolean singleConnect)
+	SessionClient(TAC_PLUS.AUTHEN.SVC svc, String port, String rem_addr, byte priv_lvl, TacacsReader tacacs, boolean singleConnect, boolean unencrypted)
 	{
-		this(svc, port, rem_addr, priv_lvl, tacacs, null, singleConnect);
+		this(svc, port, rem_addr, priv_lvl, tacacs, null, singleConnect, unencrypted);
 	}
 	
 	/** 
@@ -24,11 +31,18 @@ public class SessionClient extends Session
 	 * Only needed for interactive (ASCII) login, 
 	 * which needs to prompt user for info via a UserInterface. 
 	 */
-	SessionClient(TAC_PLUS.AUTHEN.SVC svc, String port, String rem_addr, byte priv_lvl, TacacsReader tacacs, UserInterface ui, boolean singleConnect)
+	SessionClient(TAC_PLUS.AUTHEN.SVC svc, String port, String rem_addr, byte priv_lvl, TacacsReader tacacs, UserInterface ui, boolean singleConnect, boolean unencrypted)
 	{
 		super(svc, port, rem_addr, priv_lvl, tacacs, null);
 		this.ui = ui;
 		this.singleConnect = singleConnect;
+		this.headerFlags = FLAG_ZERO;
+		if (singleConnect) {
+			this.headerFlags |= TAC_PLUS.PACKET.FLAG.SINGLE_CONNECT.code();
+		}
+		if (unencrypted){
+			this.headerFlags |= TAC_PLUS.PACKET.FLAG.UNENCRYPTED.code();
+		}
 	}
 
 	/** 
@@ -40,7 +54,6 @@ public class SessionClient extends Session
 		return super.isSingleConnectMode() && singleConnect; 
 	}
 
-	
 	/**
 	 * Calls notify() to inform public methods when the final reply packet has been received.
 	 * @param p
@@ -118,7 +131,7 @@ public class SessionClient extends Session
 	{
 		tacacs.write(new AuthenStart
 		(
-			new Header(TAC_PLUS.PACKET.VERSION.v13_0, TAC_PLUS.PACKET.TYPE.AUTHEN,id,singleConnect), 
+			new Header(this.headerFlags, TAC_PLUS.PACKET.VERSION.v13_0, TAC_PLUS.PACKET.TYPE.AUTHEN,id),
 			TAC_PLUS.AUTHEN.ACTION.LOGIN, 
 			TAC_PLUS.PRIV_LVL.MIN.code(), 
 			TAC_PLUS.AUTHEN.TYPE.ASCII, 
@@ -126,7 +139,7 @@ public class SessionClient extends Session
 			null, // server will prompts for username
 			port, 
 			rem_addr, 
-			null // server will prompt for password
+			(String)null // server will prompt for password
 		)); 
 		waitForeverForReply();
 		return (AuthenReply)result;
@@ -134,6 +147,9 @@ public class SessionClient extends Session
 
 	
 	/**
+	 * Authenticates the client using PAP.
+	 * @see The TACACS+ Protocol IETF draft, currently at https://www.ietf.org/id/draft-ietf-opsawg-tacacs-06.txt
+	 * 
 	 * @param username
 	 * @param password
 	 * @return An AuthenReply representing the result of the login attempt;
@@ -145,7 +161,7 @@ public class SessionClient extends Session
 	{
 		tacacs.write(new AuthenStart
 		(
-			new Header(TAC_PLUS.PACKET.VERSION.v13_1, TAC_PLUS.PACKET.TYPE.AUTHEN,id,singleConnect), 
+			new Header(this.headerFlags, TAC_PLUS.PACKET.VERSION.v13_1, TAC_PLUS.PACKET.TYPE.AUTHEN,id),
 			TAC_PLUS.AUTHEN.ACTION.LOGIN, 
 			TAC_PLUS.PRIV_LVL.MIN.code(), 
 			TAC_PLUS.AUTHEN.TYPE.PAP, 
@@ -161,6 +177,52 @@ public class SessionClient extends Session
 
 	
 	/**
+	 * Authenticates the client using CHAP, which avoids sending the password over the 
+	 * network (which PAP does), although the packet is already encrypted, so 
+	 * it's just extra protection.
+	 * 
+	 * @see The TACACS+ Protocol IETF draft, currently at https://www.ietf.org/id/draft-ietf-opsawg-tacacs-06.txt
+	 * @see The RFC 1334 Section 3 for some details of the CHAP protocol.
+	 * 
+	 * @param username
+	 * @param password
+	 * @return An AuthenReply representing the result of the login attempt;
+	 * possibly null if the connection was closed before a response was processed.
+	 * @throws java.util.concurrent.TimeoutException
+	 * @throws java.io.IOException
+	 */
+	public synchronized AuthenReply authenticate_CHAP(String username, String password) throws TimeoutException, IOException, NoSuchAlgorithmException
+	{
+		byte[] data = new byte[1+CHAP_CHALLENGE_LENGTH+16]; // PPP ID byte + challenge + MD5 hash response
+		// The PPP ID needs to be relatively unique per login attempt
+		data[0] = (byte)PPP_ID.getAndIncrement();
+		// In CHAP for TACACS+, the client-side generates the challenge.
+		byte[] challenge = Session.generateRandomBytes(CHAP_CHALLENGE_LENGTH);
+		MessageDigest md = MessageDigest.getInstance("MD5");
+		md.update(data[0]);
+		md.update(password.getBytes(StandardCharsets.UTF_8));
+		md.update(challenge);
+		byte[] response = md.digest();
+		System.arraycopy(challenge, 0, data, 1, challenge.length);
+		System.arraycopy(response, 0, data, 1+challenge.length, response.length);
+		
+		tacacs.write(new AuthenStart
+		(
+			new Header(this.headerFlags, TAC_PLUS.PACKET.VERSION.v13_1, TAC_PLUS.PACKET.TYPE.AUTHEN,id),
+			TAC_PLUS.AUTHEN.ACTION.LOGIN, 
+			TAC_PLUS.PRIV_LVL.MIN.code(), 
+			TAC_PLUS.AUTHEN.TYPE.CHAP, 
+			TAC_PLUS.AUTHEN.SVC.NONE, 
+			username, 
+			port, 
+			rem_addr, 
+			data
+		)); 
+		waitForReply(TIMEOUT_MILLIS);
+		return (AuthenReply)result;
+	}
+
+	/**
 	 * @param username
 	 * @param authen_meth
 	 * @param authen_type
@@ -175,7 +237,7 @@ public class SessionClient extends Session
 	{
 		tacacs.write(new AuthorRequest
 		(
-			new Header(TAC_PLUS.PACKET.VERSION.v13_0, TAC_PLUS.PACKET.TYPE.AUTHOR,id,singleConnect), 
+			new Header(this.headerFlags, TAC_PLUS.PACKET.VERSION.v13_0, TAC_PLUS.PACKET.TYPE.AUTHOR,id),
 			authen_meth,
 			(byte)0,
 			authen_type,
@@ -208,10 +270,10 @@ public class SessionClient extends Session
 			flags!=TAC_PLUS.ACCT.FLAG.STOP.code() &&
 			flags!=TAC_PLUS.ACCT.FLAG.WATCHDOG.code() &&
 			flags!=(TAC_PLUS.ACCT.FLAG.WATCHDOG.code()+TAC_PLUS.ACCT.FLAG.START.code())
-		) { throw new IOException("Invalid Accounting flags"); }
+		) { throw new IOException("Invalid Accounting headerFlags"); }
 		tacacs.write(new AcctRequest
 		(
-			new Header(TAC_PLUS.PACKET.VERSION.v13_0, TAC_PLUS.PACKET.TYPE.ACCT,id,singleConnect), 
+			new Header(this.headerFlags, TAC_PLUS.PACKET.VERSION.v13_0, TAC_PLUS.PACKET.TYPE.ACCT,id),
 			flags,
 			authen_meth,
 			TAC_PLUS.PRIV_LVL.USER.code(),
